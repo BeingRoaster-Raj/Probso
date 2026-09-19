@@ -1,0 +1,173 @@
+import shutil
+import redis
+import psycopg2
+from dotenv import load_dotenv
+import json
+import requests
+import os
+from render_pipeline import process_job
+from utils import write_status, upload_to_cloudinary
+import cloudinary
+
+load_dotenv()
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET")
+)
+
+if os.getenv("ENV", "").upper() == "PROD":
+    r = redis.Redis(
+        host=os.environ["REDIS_HOST"],
+        port=int(os.environ.get("REDIS_PORT", "6379")),
+        decode_responses=True,
+    )
+else:
+    r = redis.Redis.from_url(
+        os.environ["REDIS_URL"],
+        decode_responses=True,
+        socket_timeout=None,
+    )
+
+    
+def get_db_connection():
+    if os.getenv("ENV", "").upper() == "PROD":
+        return psycopg2.connect(
+            host=os.getenv("POSTGRES_HOST"),
+            database=os.getenv("POSTGRES_DB"),
+            user=os.getenv("POSTGRES_USER"),
+            password=os.getenv("POSTGRES_PASSWORD"),
+            port=os.getenv("POSTGRES_PORT"),
+            sslmode="require",
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
+        )
+    else:
+        return psycopg2.connect(
+            host=os.getenv("POSTGRES_HOST"),
+            database=os.getenv("POSTGRES_DB"),
+            user=os.getenv("POSTGRES_USER"),
+            password=os.getenv("POSTGRES_PASSWORD"),
+            port=os.getenv("POSTGRES_PORT"),
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5,
+        )
+
+while True:
+    task = r.brpop('task_queue', timeout=5)
+    print(f'Retrieved task: {task}')
+    if task:
+        _, task_data = task
+        print(f'Processing task: {task_data}')
+        task_data = json.loads(task_data)
+        job_id = task_data['jobId']
+        user_id = None
+        
+        try:
+            write_status(job_id, "processing", 0, "worker", r)
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            # Update the job status to in_progress
+            cursor.execute("UPDATE jobs SET status = %s WHERE id = %s ", ('in_progress', job_id))
+            conn.commit()
+            # Get the pdf file url and user_id from the database in one query
+            cursor.execute("SELECT pdf_url, user_id FROM jobs WHERE id = %s", (job_id,))
+            result = cursor.fetchone()
+            pdf_url = result[0]
+            user_id = result[1]
+            conn.close()
+            
+            if not user_id:
+                raise Exception(f"User ID not found for job ID: {job_id}")
+            
+            
+            # Download the PDF file and save it locally to tmp/{job_id}/input.pdf
+            pdf_path = f"tmp/{job_id}/input.pdf"
+            os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+            response = requests.get(pdf_url)
+            if response.status_code != 200:
+                raise Exception(f"Failed to download PDF, status code: {response.status_code}")
+            with open(pdf_path, 'wb') as f:
+                f.write(response.content)
+            # Check if file is empty
+            if os.path.getsize(pdf_path) == 0:
+                raise Exception("Downloaded PDF is empty.")
+            output = process_job(job_id, "worker", r)
+            
+            # Upload the output video to cloudinary
+            upload_result = upload_to_cloudinary(output, job_id)
+
+            print(f"Video uploaded to Cloudinary: {upload_result['secure_url']}")
+            
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            # Update the database with the output video url and mark job as completed
+            cursor.execute("UPDATE jobs SET status = %s, output_url = %s WHERE id = %s ", ('completed', upload_result['secure_url'], job_id))
+            conn.commit()
+            
+            title = task_data['title']
+            
+            # Create a new entry on the conversion table
+            cursor.execute(
+                """
+                INSERT INTO conversions (title, user_id, job_id)
+                VALUES (%s, %s, %s)
+                """,
+                (title, user_id, job_id)
+            )
+            conn.commit()
+            
+            # Deduct one token from on hold in user token balances
+            cursor.execute(
+                """
+                UPDATE user_token_balances
+                SET onhold = onhold - 1,
+                    updated_at = NOW()
+                WHERE user_id = %s AND onhold > 0
+                """,
+                (user_id,)
+            )
+            conn.commit()
+            conn.close()
+            
+            # Delete the job directory to save space
+            shutil.rmtree(f"tmp/{job_id}")
+            
+            # Publish job completion message to Redis
+            job_status = {
+                'title': title,
+                'jobId': job_id,
+                'userId': user_id,
+                'output_url': upload_result['secure_url']
+            }
+            r.publish('job_output_channel', json.dumps(job_status))
+        except Exception as e:
+            print(f"Job {job_id} failed.")
+            print(f"Error: {e}")
+            write_status(job_id, "failed", 0.80, "worker", r)
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE jobs SET status = %s, error_message = %s WHERE id = %s ", ('failed', f'{e}', job_id))
+            conn.commit()
+            if user_id:
+                # Refund the token by moving one token from onhold to balance
+                cursor.execute(
+                    """
+                    UPDATE user_token_balances
+                    SET balance = balance + 1,
+                        onhold = onhold - 1,
+                        updated_at = NOW()
+                    WHERE user_id = %s AND onhold > 0
+                    """,
+                    (user_id,)
+                )
+                conn.commit()
+            conn.close()
+            # Delete the job directory to save space
+            shutil.rmtree(f"tmp/{job_id}")
+
